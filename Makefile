@@ -1,8 +1,10 @@
 .DEFAULT_GOAL := build
-.PHONY: build test lint fmt fmt-check install run clean
+.PHONY: build check test lint fmt fmt-check install run clean
 
-build: fmt-check lint test
+build: check
 	cargo build --release
+
+check: fmt-check lint test
 
 test:
 	cargo test

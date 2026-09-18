@@ -5,17 +5,29 @@
 Installs a project's dependencies without you having to remember which toolchain it uses.
 
 `i` looks at the files in a directory, works out which package managers the project needs, and
-runs their install commands — mise first, everything else at once. Command output is hidden
-unless something fails.
+runs their install commands — mise first, then everything else at once.
+
+The whole plan is drawn before anything runs. Steps that wait for mise sit indented under it, and
+each line turns into a spinner with a running clock and the command's latest output while it
+works:
 
 ```
-✔ mise     2.1s
-✔ rust     3.4s
-✔ bun      812ms
-○ maven    mvn not found
+⠼ mise     14s  aqua:sharkdp/fd@10.1.0  installing  8.1s
+  ◌ rust   waiting for mise
+  ◌ bun    waiting for mise
+  ◌ maven  waiting for mise
+```
+
+and settles into a result when it finishes. Full output is only shown for a step that failed.
+
+```
+✔ mise     16.2s
+  ✔ rust   3.4s
+  ✔ bun    812ms
+  ○ maven  mvn not found
 
 skipped    maven (mvn not found)
-total      3.5s
+total      19.7s
 ```
 
 ## Install
@@ -30,7 +42,7 @@ make install
 i                  # install dependencies in the current directory
 i -C path/to/repo  # ...or in another one
 i -n               # print what was detected, why, and the commands that would run
-i -v               # stream every command's output as it runs
+i log              # install, streaming every command's output as it runs
 ```
 
 `--dry-run` names each toolchain, the files that gave it away, and its install command:
@@ -44,10 +56,12 @@ terraform  main.tf                  $ terraform init -input=false
 
 Each toolchain keeps its colour across both modes.
 
-`--verbose` drops the spinners and streams both output streams of every command as they
-arrive, behind a per-step coloured prefix:
+`i log` drops the tree and streams both output streams of every command as they arrive,
+behind a per-step coloured prefix:
 
 ```
+[go]      waiting for mise
+[bun]     waiting for mise
 [mise]    $ mise install
 [mise]    mise all tools are installed
 [go]      $ mise exec -- go mod download
@@ -57,8 +71,10 @@ arrive, behind a per-step coloured prefix:
 [bun]     Checked 1 install across 2 packages
 ```
 
-Status lines, streamed output and the summary go to stderr; `--dry-run` writes the plan to
-stdout. The exit status is non-zero if any install command failed — a missing tool is a skip,
+The tree, streamed output and the summary go to stderr; `--dry-run` writes the plan to
+stdout. When stderr is not a terminal the tree is not drawn, and each step prints its result
+line as it finishes. Install commands get no stdin, so a tool that would prompt fails instead of
+hanging. The exit status is non-zero if any install command failed — a missing tool is a skip,
 not a failure.
 
 ## What it detects

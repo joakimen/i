@@ -1,13 +1,13 @@
-//! Terminal reporting: a live status line per install step, or a coloured prefix
-//! per step when output is streamed, then a summary.
+//! Terminal reporting: the install plan drawn as a tree that updates in place,
+//! or a coloured prefix per step when output is streamed, then a summary.
 //!
 //! Everything is written to stderr so stdout stays free for machine-readable
-//! output. Grouping and formatting are pure; only printing touches the terminal.
+//! output. Layout and formatting are pure; only drawing touches the terminal.
 
 use std::time::Duration;
 
 use console::{Color, Style, style};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 
 use crate::run::{Outcome, Status};
 
@@ -22,58 +22,96 @@ const PREFIX_COLOURS: &[Color] = &[
     Color::Blue,
 ];
 const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Set before a step that waits for another, placing it under that step.
+const INDENT: &str = "  ";
 
-pub struct Ui {
-    multi: MultiProgress,
-    width: usize,
-    attended: bool,
+/// A step as the tree shows it: its name, and the step it waits for.
+pub struct Node<'a> {
+    pub name: &'a str,
+    pub after: Option<&'a str>,
 }
 
-/// A single step's status line, from start to final state.
+/// Where a step's line sits in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Slot {
+    indent: &'static str,
+    /// The step name, padded so every line's timing starts in one column.
+    name: String,
+}
+
+/// The live tree: one line per step, drawn as soon as the plan is known. Lines
+/// are only drawn when stderr is a terminal; otherwise each step prints its
+/// final line when it finishes.
+pub struct Ui {
+    _multi: MultiProgress,
+    lines: Vec<(Slot, Option<ProgressBar>)>,
+}
+
+/// A running step's line, from start to final state.
 pub struct Line {
+    slot: Slot,
     bar: Option<ProgressBar>,
-    width: usize,
 }
 
 impl Ui {
-    pub fn new(names: &[&str]) -> Self {
+    pub fn new(nodes: &[Node<'_>]) -> Self {
+        let multi = MultiProgress::new();
+        let attended = console::user_attended_stderr();
+
+        let lines = layout(nodes)
+            .into_iter()
+            .zip(nodes)
+            .map(|(slot, node)| {
+                let bar = attended.then(|| {
+                    let bar = multi.add(ProgressBar::new_spinner());
+                    bar.set_style(plain());
+                    bar.set_message(pending_line(&slot, node.after));
+                    bar.tick();
+                    bar
+                });
+                (slot, bar)
+            })
+            .collect();
+
         Ui {
-            multi: MultiProgress::new(),
-            width: names.iter().map(|name| name.len()).max().unwrap_or(0),
-            attended: console::user_attended_stderr(),
+            _multi: multi,
+            lines,
         }
     }
 
-    pub fn start(&self, name: &str) -> Line {
-        if !self.attended {
-            return Line {
-                bar: None,
-                width: self.width,
-            };
+    /// Switches the step at `index` from waiting to a spinner that counts the
+    /// time it has been running.
+    pub fn start(&self, index: usize) -> Line {
+        let (slot, bar) = &self.lines[index];
+
+        if let Some(bar) = bar {
+            bar.set_style(running(slot));
+            bar.set_message("");
+            bar.reset_elapsed();
+            bar.enable_steady_tick(TICK);
         }
 
-        let bar = self.multi.add(ProgressBar::new_spinner());
-        bar.set_style(
-            ProgressStyle::with_template("{spinner:.blue} {msg}")
-                .expect("static template")
-                .tick_strings(FRAMES),
-        );
-        bar.set_message(name.to_string());
-        bar.enable_steady_tick(TICK);
-
         Line {
-            bar: Some(bar),
-            width: self.width,
+            slot: slot.clone(),
+            bar: bar.clone(),
         }
     }
 }
 
 impl Line {
+    /// Shows the latest thing the step printed next to its spinner, so a long
+    /// install visibly makes progress.
+    pub fn activity(&self, output: &str) {
+        if let (Some(bar), Some(text)) = (&self.bar, activity(output)) {
+            bar.set_message(text);
+        }
+    }
+
     pub fn finish(self, outcome: &Outcome) {
-        let text = status_line(outcome, self.width);
+        let text = status_line(outcome, &self.slot);
         match self.bar {
             Some(bar) => {
-                bar.set_style(ProgressStyle::with_template("{msg}").expect("static template"));
+                bar.set_style(plain());
                 bar.finish_with_message(text);
             }
             None => eprintln!("{text}"),
@@ -81,24 +119,92 @@ impl Line {
     }
 }
 
-fn status_line(outcome: &Outcome, width: usize) -> String {
-    let name = format!("{:width$}", outcome.name);
+fn plain() -> ProgressStyle {
+    ProgressStyle::with_template("{msg}").expect("static template")
+}
+
+fn running(slot: &Slot) -> ProgressStyle {
+    let template = format!(
+        "{}{{spinner:.blue}} {}  {{took:.dim}}  {{wide_msg:.dim}}",
+        slot.indent, slot.name
+    );
+    ProgressStyle::with_template(&template)
+        .expect("template built from a step name")
+        .tick_strings(FRAMES)
+        .with_key(
+            "took",
+            |state: &ProgressState, out: &mut dyn std::fmt::Write| {
+                let _ = write!(out, "{}s", state.elapsed().as_secs());
+            },
+        )
+}
+
+/// Indents every step that waits for another and pads the names so the column
+/// after them lines up across the whole tree.
+fn layout(nodes: &[Node<'_>]) -> Vec<Slot> {
+    let indent = |node: &Node<'_>| if node.after.is_some() { INDENT } else { "" };
+    let width = nodes
+        .iter()
+        .map(|node| indent(node).len() + node.name.len())
+        .max()
+        .unwrap_or(0);
+
+    nodes
+        .iter()
+        .map(|node| {
+            let indent = indent(node);
+            Slot {
+                indent,
+                name: format!("{:1$}", node.name, width - indent.len()),
+            }
+        })
+        .collect()
+}
+
+fn pending_line(slot: &Slot, after: Option<&str>) -> String {
+    let waiting = after.map_or_else(
+        || "queued".to_string(),
+        |after| format!("waiting for {after}"),
+    );
+    format!(
+        "{}{} {}  {}",
+        slot.indent,
+        style("◌").dim(),
+        style(&slot.name).dim(),
+        style(waiting).dim()
+    )
+}
+
+/// Reduces a line of a step's output to what is worth showing beside its
+/// spinner: colour codes removed, and only the last frame of a line that
+/// redraws itself with carriage returns. Blank lines yield nothing.
+fn activity(output: &str) -> Option<String> {
+    let plain = console::strip_ansi_codes(output);
+    plain
+        .split('\r')
+        .map(str::trim)
+        .rfind(|frame| !frame.is_empty())
+        .map(str::to_string)
+}
+
+fn status_line(outcome: &Outcome, slot: &Slot) -> String {
+    let (indent, name) = (slot.indent, &slot.name);
     match &outcome.status {
         Status::Installed => format!(
-            "{} {name}  {}",
+            "{indent}{} {name}  {}",
             style("✔").green(),
             style(format_duration(outcome.duration)).dim()
         ),
         Status::Skipped { reason } => {
             format!(
-                "{} {}  {}",
+                "{indent}{} {}  {}",
                 style("○").dim(),
                 style(name).dim(),
                 style(reason).dim()
             )
         }
         Status::Failed { code } => format!(
-            "{} {name}  {}",
+            "{indent}{} {name}  {}",
             style("✖").red(),
             style(failure_reason(*code)).red()
         ),
@@ -314,6 +420,64 @@ mod tests {
         for (prefix, name) in prefixes.iter().zip(names) {
             assert!(prefix.contains(&format!("[{name}]")), "{prefix}");
         }
+    }
+
+    #[test]
+    fn steps_that_wait_are_indented_under_the_step_they_wait_for() {
+        let slots = layout(&[
+            Node {
+                name: "mise",
+                after: None,
+            },
+            Node {
+                name: "terraform",
+                after: Some("mise"),
+            },
+        ]);
+
+        assert_eq!(
+            slots,
+            [
+                Slot {
+                    indent: "",
+                    name: "mise       ".to_string(),
+                },
+                Slot {
+                    indent: INDENT,
+                    name: "terraform".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tree_without_dependencies_is_flat() {
+        let slots = layout(&[
+            Node {
+                name: "go",
+                after: None,
+            },
+            Node {
+                name: "rust",
+                after: None,
+            },
+        ]);
+
+        assert!(slots.iter().all(|slot| slot.indent.is_empty()));
+        assert_eq!(slots[0].name, "go  ");
+    }
+
+    #[test]
+    fn activity_is_the_last_visible_frame_of_a_line() {
+        assert_eq!(activity("  fetching  "), Some("fetching".to_string()));
+        assert_eq!(activity("\x1b[32mdone\x1b[0m"), Some("done".to_string()));
+        assert_eq!(activity("10%\r50%\r"), Some("50%".to_string()));
+    }
+
+    #[test]
+    fn blank_output_is_not_activity() {
+        assert_eq!(activity(""), None);
+        assert_eq!(activity("   \r  "), None);
     }
 
     #[test]
