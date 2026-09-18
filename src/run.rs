@@ -1,12 +1,12 @@
 //! Running install steps as child processes.
 //!
-//! Output is either captured, so concurrent steps never interleave and only
-//! failures need to be shown, or streamed line by line behind a prefix that says
-//! which step it came from.
+//! Every line a step writes, on either stream, is handed to the caller as it
+//! arrives and is also kept, so a failure can be shown in full afterwards.
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::plan::Step;
@@ -27,7 +27,8 @@ pub enum Status {
 pub struct Outcome {
     pub name: &'static str,
     pub status: Status,
-    /// Combined stdout and stderr of the command, empty when it never ran.
+    /// Every line the command wrote to stdout or stderr, in the order they
+    /// arrived; empty when it never ran.
     pub output: String,
     pub duration: Duration,
 }
@@ -38,27 +39,18 @@ impl Outcome {
     }
 }
 
-/// What to do with a step's output while it runs.
-#[derive(Debug, Clone, Copy)]
-pub enum Output<'a> {
-    /// Collect both streams; the caller decides whether to show them.
-    Capture,
-    /// Write every line to stderr as it arrives, behind `prefix`.
-    Stream { prefix: &'a str },
-}
-
 /// A finished child process.
 struct Completion {
     status: ExitStatus,
     output: String,
 }
 
-pub fn run(step: &Step, directory: &Path, output: Output<'_>) -> Outcome {
+/// Runs `step` in `directory`, calling `on_line` with each line of output as it
+/// is written. The child gets no stdin, so a tool that prompts fails instead of
+/// waiting for an answer that never comes.
+pub fn run(step: &Step, directory: &Path, on_line: &(dyn Fn(&str) + Sync)) -> Outcome {
     let started = Instant::now();
-    let result = match output {
-        Output::Capture => capture(step, directory),
-        Output::Stream { prefix } => stream(step, directory, prefix),
-    };
+    let result = execute(step, directory, on_line);
     let duration = started.elapsed();
 
     let (status, output) = match result {
@@ -89,46 +81,46 @@ pub fn run(step: &Step, directory: &Path, output: Output<'_>) -> Outcome {
     }
 }
 
-fn command(step: &Step, directory: &Path) -> Command {
-    let mut command = Command::new(step.program);
-    command.args(&step.args).current_dir(directory);
-    command
-}
-
-fn capture(step: &Step, directory: &Path) -> io::Result<Completion> {
-    let result = command(step, directory).output()?;
-
-    Ok(Completion {
-        status: result.status,
-        output: merge_output(&result.stdout, &result.stderr),
-    })
-}
-
-/// Forwards both streams to stderr while the child runs. Reading them on separate
-/// threads keeps a child that fills one pipe from blocking on the other.
-fn stream(step: &Step, directory: &Path, prefix: &str) -> io::Result<Completion> {
-    let mut child = command(step, directory)
+/// Reads both streams on their own threads while the child runs, so a child
+/// that fills one pipe never blocks on the other.
+fn execute(
+    step: &Step,
+    directory: &Path,
+    on_line: &(dyn Fn(&str) + Sync),
+) -> io::Result<Completion> {
+    let mut child = Command::new(step.program)
+        .args(&step.args)
+        .current_dir(directory)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
+    let output = Mutex::new(String::new());
+    let record = |line: &str| {
+        on_line(line);
+        let mut output = output.lock().expect("output lock poisoned");
+        output.push_str(line);
+        output.push('\n');
+    };
 
     std::thread::scope(|scope| {
-        scope.spawn(|| forward(stdout, prefix));
-        scope.spawn(|| forward(stderr, prefix));
+        scope.spawn(|| lines(stdout, &record));
+        scope.spawn(|| lines(stderr, &record));
     });
 
+    let output = output.into_inner().expect("output lock poisoned");
     Ok(Completion {
         status: child.wait()?,
-        output: String::new(),
+        output: output.trim_end().to_string(),
     })
 }
 
-/// Writes each line of `source` to stderr behind `prefix`. One `eprintln!` per
-/// line keeps lines from concurrent steps whole.
-fn forward(source: impl Read, prefix: &str) {
+/// Calls `on_line` with each line of `source`, without its line ending. Bytes
+/// that are not UTF-8 are replaced rather than dropped.
+fn lines(source: impl Read, on_line: &dyn Fn(&str)) {
     let mut reader = BufReader::new(source);
     let mut line = Vec::new();
 
@@ -137,49 +129,35 @@ fn forward(source: impl Read, prefix: &str) {
             break;
         }
         let text = String::from_utf8_lossy(&line);
-        eprintln!("{prefix}{}", text.trim_end_matches(['\n', '\r']));
+        on_line(text.trim_end_matches(['\n', '\r']));
         line.clear();
     }
 }
 
-/// Joins a command's streams into the single block shown on failure, stdout
-/// first, with trailing blank lines removed.
-fn merge_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut merged = String::new();
-
-    for stream in [stdout, stderr] {
-        let text = String::from_utf8_lossy(stream);
-        let text = text.trim_end();
-        if text.is_empty() {
-            continue;
-        }
-        if !merged.is_empty() {
-            merged.push('\n');
-        }
-        merged.push_str(text);
-    }
-
-    merged
-}
-
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
-    #[test]
-    fn merging_puts_stdout_before_stderr() {
-        assert_eq!(merge_output(b"out\n", b"err\n"), "out\nerr");
+    fn collect(source: &[u8]) -> Vec<String> {
+        let seen = RefCell::new(Vec::new());
+        lines(source, &|line| seen.borrow_mut().push(line.to_string()));
+        seen.into_inner()
     }
 
     #[test]
-    fn merging_drops_empty_streams() {
-        assert_eq!(merge_output(b"", b"err\n"), "err");
-        assert_eq!(merge_output(b"out\n", b""), "out");
-        assert_eq!(merge_output(b"", b""), "");
+    fn lines_are_reported_without_their_endings() {
+        assert_eq!(collect(b"one\r\ntwo\n\nthree"), ["one", "two", "", "three"]);
     }
 
     #[test]
-    fn merging_keeps_invalid_utf8_readable() {
-        assert_eq!(merge_output(&[0xff, b'a'], b""), "\u{fffd}a");
+    fn an_empty_stream_reports_nothing() {
+        assert!(collect(b"").is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_stays_readable() {
+        assert_eq!(collect(&[0xff, b'a', b'\n']), ["\u{fffd}a"]);
     }
 }
