@@ -19,7 +19,7 @@ fmt-check:
 	cargo fmt --check
 
 install:
-	cargo install --path .
+	cargo install --locked --path .
 
 run:
 	cargo run -- $(ARGS)
